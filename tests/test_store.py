@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from shortener.codes import is_valid_code
-from shortener.store import MAX_ATTEMPTS, StoreBusyError, load_mappings, save_mapping, shorten_and_save
+from shortener.store import MAX_ATTEMPTS, StoreBusyError, load_mappings, lookup, save_mapping, shorten_and_save
 from shortener.urls import InvalidURLError
 from tests.test_urls import VALID_URLS
 
@@ -37,6 +37,38 @@ class LoadMappingsTest(TempStoreTestCase):
         save_mapping(self.path, "abc1234", "https://a.com")
         save_mapping(self.path, "XYZ9876", "https://b.com")
         self.assertEqual(load_mappings(self.path), {"abc1234": "https://a.com", "XYZ9876": "https://b.com"})
+
+
+class LookupTest(TempStoreTestCase):
+    def test_finds_stored_url(self):
+        save_mapping(self.path, "abc1234", "https://a.com")
+        save_mapping(self.path, "XYZ9876", "https://bücher.de/straße")
+        self.assertEqual(lookup(self.path, "abc1234"), "https://a.com")
+        self.assertEqual(lookup(self.path, "XYZ9876"), "https://bücher.de/straße")
+
+    def test_unknown_code_is_none(self):
+        save_mapping(self.path, "abc1234", "https://a.com")
+        self.assertIsNone(lookup(self.path, "XYZ9876"))
+
+    def test_codes_are_case_sensitive(self):
+        save_mapping(self.path, "abc1234", "https://a.com")
+        self.assertIsNone(lookup(self.path, "ABC1234"))
+
+    def test_missing_database_is_none_and_not_created(self):
+        self.assertIsNone(lookup(self.path, "abc1234"))
+        self.assertFalse(self.path.exists())
+
+    def test_database_without_table_is_none(self):
+        sqlite3.connect(self.path).close()
+        self.assertIsNone(lookup(self.path, "abc1234"))
+
+    def test_uses_primary_key_index(self):
+        save_mapping(self.path, "abc1234", "https://a.com")
+        with closing(sqlite3.connect(self.path)) as conn:
+            plan = conn.execute("EXPLAIN QUERY PLAN SELECT url FROM urls WHERE code = ?", ("abc1234",)).fetchall()
+        detail = " ".join(row[-1] for row in plan)
+        self.assertIn("USING INDEX", detail)
+        self.assertNotIn("SCAN", detail)
 
 
 class SaveMappingTest(TempStoreTestCase):

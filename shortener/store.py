@@ -86,20 +86,31 @@ def _connect(path: StorePath) -> sqlite3.Connection:
     return conn
 
 
-def load_mappings(path: StorePath) -> dict[str, str]:
-    """Return all stored mappings as {code: url}. A missing database means no mappings."""
+def _query(path: StorePath, sql: str, params: tuple = ()) -> list[tuple]:
+    """Run a read-only query. A missing database or table gives no rows."""
     path = Path(path)
     if not path.exists():
-        return {}
+        return []
     # Read-only, so reading never creates the database file.
     uri = f"{path.absolute().as_uri()}?mode=ro"
     with _busy_as_error(), closing(sqlite3.connect(uri, uri=True, autocommit=True, timeout=BUSY_TIMEOUT_MS / 1000)) as conn:
         try:
-            return dict(conn.execute("SELECT code, url FROM urls"))
+            return conn.execute(sql, params).fetchall()
         except sqlite3.OperationalError as e:
             if "no such table" in str(e):
-                return {}
+                return []
             raise
+
+
+def lookup(path: StorePath, code: str) -> str | None:
+    """Return the URL stored under `code`, or None. Uses the primary-key index, so it doesn't scan the table."""
+    rows = _query(path, "SELECT url FROM urls WHERE code = ?", (code,))
+    return rows[0][0] if rows else None
+
+
+def load_mappings(path: StorePath) -> dict[str, str]:
+    """Return all stored mappings as {code: url}. A missing database means no mappings."""
+    return dict(_query(path, "SELECT code, url FROM urls"))
 
 
 def save_mapping(path: StorePath, code: str, url: str) -> None:

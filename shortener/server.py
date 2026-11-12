@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
 
 from shortener.codes import is_valid_code
-from shortener.store import StoreBusyError, StorePath, load_mappings, shorten_and_save
+from shortener.store import StoreBusyError, StorePath, lookup, shorten_and_save
 from shortener.urls import InvalidURLError
 
 MAX_BODY_BYTES = 8192
@@ -72,7 +72,7 @@ class ShortenerHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         code = urlsplit(self.path).path.removeprefix("/")
         try:
-            url = load_mappings(self.server.store_path).get(code) if is_valid_code(code) else None
+            url = lookup(self.server.store_path, code) if is_valid_code(code) else None
         except StoreBusyError as e:
             self._send_busy(e)
             return

@@ -154,7 +154,7 @@ class BusyStoreTest(ServerTestCase):
         self.assertIn("busy", json.loads(body)["error"])
 
     def test_get_returns_503_when_store_is_busy(self):
-        with mock.patch("shortener.server.load_mappings", side_effect=StoreBusyError("store is busy")):
+        with mock.patch("shortener.server.lookup", side_effect=StoreBusyError("store is busy")):
             status, headers, _ = self.request("GET", "/AAAAAAA")
         self.assertEqual(status, 503)
         self.assertEqual(headers["Retry-After"], "1")
