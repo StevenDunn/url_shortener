@@ -1,8 +1,6 @@
-"""Input URL validation and shortening."""
+"""Input URL validation."""
 
 from urllib.parse import urlsplit
-
-from shortener.codes import DEFAULT_LENGTH, generate_code
 
 MAX_URL_LENGTH = 2048
 HOST_SCHEMES = {"http", "https", "ftp", "gopher"}
@@ -59,9 +57,3 @@ def _validate_mailto(netloc: str, address: str) -> None:
     local, at, domain = address.partition("@")
     if not (local and at and domain) or "@" in domain:
         raise InvalidURLError("mailto URL must contain one address like name@example.com")
-
-
-def shorten(url: object, length: int = DEFAULT_LENGTH) -> str:
-    """Validate `url` and return a new short code for it. Nothing is stored yet."""
-    validate_url(url)
-    return generate_code(length)

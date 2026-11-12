@@ -7,7 +7,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-from shortener.codes import is_valid_code
+from shortener.codes import DEFAULT_LENGTH, is_valid_code
 from shortener.store import (
     MAX_ATTEMPTS,
     StoreBusyError,
@@ -18,7 +18,7 @@ from shortener.store import (
     shorten_and_save,
 )
 from shortener.urls import InvalidURLError
-from tests.test_urls import VALID_URLS
+from tests.test_urls import INVALID_URLS, VALID_URLS
 
 # Written by the flat-file store on main, before the SQLite migration.
 SAMPLE_TSV = Path(__file__).parent / "fixtures" / "sample_urls.tsv"
@@ -105,7 +105,11 @@ class ShortenAndSaveTest(TempStoreTestCase):
     def test_stores_google(self):
         code = shorten_and_save("https://www.google.com", self.path)
         self.assertTrue(is_valid_code(code))
+        self.assertEqual(len(code), DEFAULT_LENGTH)
         self.assertEqual(load_mappings(self.path), {code: "https://www.google.com"})
+
+    def test_custom_length(self):
+        self.assertEqual(len(shorten_and_save("https://www.google.com", self.path, length=10)), 10)
 
     def test_stores_all_valid_urls(self):
         codes = {url: shorten_and_save(url, self.path) for url in VALID_URLS}
@@ -120,9 +124,10 @@ class ShortenAndSaveTest(TempStoreTestCase):
         self.assertEqual(first, second)
         self.assertEqual(self.row_count(), 1)
 
-    def test_invalid_url_writes_nothing(self):
-        with self.assertRaises(InvalidURLError):
-            shorten_and_save("javascript:alert(1)", self.path)
+    def test_invalid_urls_write_nothing(self):
+        for url in INVALID_URLS:
+            with self.subTest(url=url), self.assertRaises(InvalidURLError):
+                shorten_and_save(url, self.path)
         self.assertFalse(self.path.exists())
 
     def test_retries_on_code_collision(self):
