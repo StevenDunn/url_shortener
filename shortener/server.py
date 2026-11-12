@@ -65,6 +65,10 @@ class ShortenerHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         self._run(self._get)
 
+    def do_HEAD(self) -> None:
+        # Same status and headers as GET; _send_json leaves out the body for HEAD.
+        self._run(self._get)
+
     def _run(self, handle: Callable[[], None]) -> None:
         """Call `handle`; on an unexpected error, log it and answer 500 instead of dropping the connection."""
         self._response_started = False
@@ -171,7 +175,8 @@ class ShortenerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def log_message(self, format: str, *args) -> None:
         if self.server.log:

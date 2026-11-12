@@ -365,6 +365,56 @@ class BusyStoreTest(ServerTestCase):
         self.assertEqual(headers["Retry-After"], "1")
 
 
+class HeadTest(ServerTestCase):
+    def head_raw(self, path):
+        """Send HEAD and read everything until the server closes. Returns (status, headers, bytes after headers)."""
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.addCleanup(sock.close)
+        sock.sendall(f"HEAD {path} HTTP/1.1\r\nHost: x\r\n\r\n".encode())
+        reply = b""
+        while chunk := sock.recv(4096):
+            reply += chunk
+        head, _, rest = reply.partition(b"\r\n\r\n")
+        status_line, *header_lines = head.decode("latin-1").split("\r\n")
+        headers = dict(line.split(": ", 1) for line in header_lines)
+        return int(status_line.split()[1]), headers, rest
+
+    def assert_same_as_get(self, path):
+        get_status, get_headers, get_body = self.request("GET", path)
+        status, headers, rest = self.head_raw(path)
+        self.assertEqual(status, get_status)
+        for name in ("Location", "Content-Type", "Content-Length", "Retry-After"):
+            self.assertEqual(headers.get(name), get_headers[name], name)
+        self.assertEqual(rest, b"", "HEAD must not send a body")
+        return status, get_body
+
+    def test_known_code_redirects_without_body(self):
+        save_mapping(self.path, "AAAAAAA", "https://bücher.de/straße")
+        status, _ = self.assert_same_as_get("/AAAAAAA")
+        self.assertEqual(status, 302)
+
+    def test_unknown_code_is_404_without_body(self):
+        status, get_body = self.assert_same_as_get("/BBBBBBB")
+        self.assertEqual(status, 404)
+        self.assertNotEqual(get_body, b"", "GET still sends the JSON body")
+        self.assertFalse(self.path.exists(), "HEAD must not create the database")
+
+    def test_busy_store_is_503_without_body(self):
+        with mock.patch("shortener.server.lookup", side_effect=StoreBusyError("store is busy")):
+            status, _ = self.assert_same_as_get("/AAAAAAA")
+        self.assertEqual(status, 503)
+
+    def test_unexpected_error_is_500_without_body(self):
+        with mock.patch("shortener.server.lookup", side_effect=ValueError("boom")):
+            status, _ = self.assert_same_as_get("/AAAAAAA")
+        self.assertEqual(status, 500)
+
+    def test_http_client_head(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        status, headers, body = self.request("HEAD", "/AAAAAAA")
+        self.assertEqual((status, headers["Location"], body), (302, "https://a.com", b""))
+
+
 class LocationTest(unittest.TestCase):
     def test_leaves_ascii_urls_unchanged(self):
         url = "https://example.com/a%20b?q=1&r=[2]#frag"
