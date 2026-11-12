@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Runtime mapping file written by the server
+urls.tsv
