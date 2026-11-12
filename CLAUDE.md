@@ -12,6 +12,7 @@ HTTP API (JSON in/out), bound to `127.0.0.1:8000` by default:
 - `GET /<code>` → `302` with `Location: <url>` (non-ASCII percent-encoded); unknown → `404`.
 - Store locked by another writer past the busy timeout → `503` with `Retry-After: 1`.
 - Every connection has a `REQUEST_TIMEOUT_SECONDS` (10 s) socket timeout (`ShortenerHandler.timeout`): idle or stalled connections are closed; a stalled POST body gets `408`. Tests patch `ShortenerHandler.timeout` to keep this short.
+- Any other unexpected exception → `500 {"error": "internal server error"}` (no internal details in the body); the traceback goes to the server log (`log_error`, so `log=False` silences it). `do_GET`/`do_POST` only call `_run(self._get / self._post)`; put request logic in `_get`/`_post` so it stays covered. If the response had already started, the connection is just closed.
 
 ## Environment
 

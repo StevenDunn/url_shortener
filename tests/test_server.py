@@ -289,6 +289,62 @@ class TimeoutTest(ServerTestCase):
         self.assertTrue(is_valid_code(body["code"]))
 
 
+class UnexpectedErrorTest(ServerTestCase):
+    def capture(self, method, path, body=None, log=False):
+        """Make a request while capturing the server's stderr. Returns (status, body, stderr)."""
+        self.server.log = log
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            status, _, resp = self.request(method, path, body)
+        return status, resp, err.getvalue()
+
+    def test_post_error_returns_generic_500(self):
+        failure = sqlite3.DatabaseError("database disk image is malformed")
+        with mock.patch("shortener.server.shorten_and_save", side_effect=failure):
+            status, body, _ = self.capture("POST", "/", json.dumps({"url": "https://www.google.com"}))
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "internal server error"}, "internal details must not leak")
+
+    def test_get_error_returns_500(self):
+        with mock.patch("shortener.server.lookup", side_effect=ValueError("boom")):
+            status, body, _ = self.capture("GET", "/AAAAAAA")
+        self.assertEqual(status, 500)
+        self.assertEqual(json.loads(body), {"error": "internal server error"})
+
+    def test_logs_traceback_when_logging_is_on(self):
+        with mock.patch("shortener.server.lookup", side_effect=ValueError("boom")):
+            _, _, stderr = self.capture("GET", "/AAAAAAA", log=True)
+        self.assertIn("unexpected error handling GET /AAAAAAA", stderr)
+        self.assertIn("Traceback", stderr)
+        self.assertIn("ValueError: boom", stderr)
+
+    def test_silent_when_logging_is_off(self):
+        with mock.patch("shortener.server.lookup", side_effect=ValueError("boom")):
+            _, _, stderr = self.capture("GET", "/AAAAAAA")
+        self.assertEqual(stderr, "")
+
+    def test_error_after_response_started_closes_connection(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        original = ShortenerHandler.send_header
+
+        def failing_send_header(handler, name, value):
+            if name == "Location":
+                raise RuntimeError("fails mid-response")
+            original(handler, name, value)
+
+        with mock.patch.object(ShortenerHandler, "send_header", failing_send_header):
+            with self.assertRaises(http.client.RemoteDisconnected):
+                self.capture("GET", "/AAAAAAA")
+
+    def test_keeps_serving_after_an_error(self):
+        with mock.patch("shortener.server.lookup", side_effect=ValueError("boom")):
+            self.capture("GET", "/AAAAAAA")
+        status, body = self.post_url("https://www.google.com")
+        self.assertEqual(status, 201)
+        status, headers, _ = self.request("GET", f"/{body['code']}")
+        self.assertEqual(status, 302)
+
+
 class BusyStoreTest(ServerTestCase):
     def test_post_returns_503_while_another_writer_holds_the_lock(self):
         save_mapping(self.path, "AAAAAAA", "https://a.com")

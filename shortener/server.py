@@ -2,6 +2,8 @@
 
 import json
 import re
+import traceback
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
@@ -54,7 +56,34 @@ class ShortenerHandler(BaseHTTPRequestHandler):
     # http.server; a stalled body read is answered with 408 in do_POST.
     timeout = REQUEST_TIMEOUT_SECONDS
 
+    _response_started = False
+
     def do_POST(self) -> None:
+        self._run(self._post)
+
+    def do_GET(self) -> None:
+        self._run(self._get)
+
+    def _run(self, handle: Callable[[], None]) -> None:
+        """Call `handle`; on an unexpected error, log it and answer 500 instead of dropping the connection."""
+        self._response_started = False
+        try:
+            handle()
+        except Exception:
+            self.log_error("unexpected error handling %s %s:\n%s", self.command, self.path, traceback.format_exc())
+            self.close_connection = True
+            # Once a response has begun we can't start another; closing the connection is all that's left.
+            if not self._response_started:
+                try:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
+                except OSError:
+                    pass
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._response_started = True
+        super().send_response(code, message)
+
+    def _post(self) -> None:
         if urlsplit(self.path).path != "/":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -114,7 +143,7 @@ class ShortenerHandler(BaseHTTPRequestHandler):
         bound_host, bound_port = self.server.server_address[:2]
         return f"http://{bound_host}:{bound_port}"
 
-    def do_GET(self) -> None:
+    def _get(self) -> None:
         code = urlsplit(self.path).path.removeprefix("/")
         try:
             url = lookup(self.server.store_path, code) if is_valid_code(code) else None
@@ -124,8 +153,9 @@ class ShortenerHandler(BaseHTTPRequestHandler):
         if url is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown short code"})
             return
+        location = _location(url)
         self.send_response(HTTPStatus.FOUND)
-        self.send_header("Location", _location(url))
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
