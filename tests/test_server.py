@@ -383,6 +383,12 @@ class MakeServerTest(unittest.TestCase):
             self.assertFalse(server.log)
             self.assertEqual(server.base_url, "https://sho.rt")
 
+    def test_skips_reverse_dns_lookup(self):
+        with mock.patch("socket.getfqdn") as getfqdn, make_server("127.0.0.1", 0, "m.db", log=False) as server:
+            getfqdn.assert_not_called()
+            self.assertEqual(server.server_name, "127.0.0.1")
+            self.assertEqual(server.server_port, server.server_address[1])
+
     def test_handler_uses_request_timeout(self):
         self.assertEqual(REQUEST_TIMEOUT_SECONDS, 10)
         self.assertEqual(ShortenerHandler.timeout, REQUEST_TIMEOUT_SECONDS)

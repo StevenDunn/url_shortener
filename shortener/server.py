@@ -2,6 +2,7 @@
 
 import json
 import re
+import socketserver
 import traceback
 from collections.abc import Callable
 from http import HTTPStatus
@@ -180,6 +181,13 @@ class ShortenerHandler(BaseHTTPRequestHandler):
 class ShortenerServer(ThreadingHTTPServer):
     # socketserver's default listen backlog of 5 resets connections in a burst.
     request_queue_size = 128
+
+    def server_bind(self) -> None:
+        # HTTPServer.server_bind sets server_name with socket.getfqdn(host), a reverse DNS
+        # lookup that can take ~30 s on some Macs (e.g. GitHub's macOS runners). Only
+        # http.server's CGI support uses server_name, so skip the lookup.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
 
     store_path: StorePath
     log: bool
