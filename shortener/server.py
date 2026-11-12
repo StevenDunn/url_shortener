@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
 
 from shortener.codes import is_valid_code
-from shortener.store import StorePath, load_mappings, shorten_and_save
+from shortener.store import StoreBusyError, StorePath, lookup, shorten_and_save
 from shortener.urls import InvalidURLError
 
 MAX_BODY_BYTES = 8192
@@ -56,6 +56,9 @@ class ShortenerHandler(BaseHTTPRequestHandler):
         except InvalidURLError as e:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(e)})
             return
+        except StoreBusyError as e:
+            self._send_busy(e)
+            return
         except RuntimeError as e:
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
@@ -68,7 +71,11 @@ class ShortenerHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         code = urlsplit(self.path).path.removeprefix("/")
-        url = load_mappings(self.server.store_path).get(code) if is_valid_code(code) else None
+        try:
+            url = lookup(self.server.store_path, code) if is_valid_code(code) else None
+        except StoreBusyError as e:
+            self._send_busy(e)
+            return
         if url is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown short code"})
             return
@@ -77,9 +84,14 @@ class ShortenerHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def _send_json(self, status: HTTPStatus, body: dict) -> None:
+    def _send_busy(self, error: StoreBusyError) -> None:
+        self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": str(error)}, {"Retry-After": "1"})
+
+    def _send_json(self, status: HTTPStatus, body: dict, headers: dict[str, str] | None = None) -> None:
         data = json.dumps(body).encode("utf-8")
         self.send_response(status)
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()

@@ -1,10 +1,13 @@
 import contextlib
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from shortener.cli import DEFAULT_HOST, DEFAULT_PORT, main, parse_args
-from shortener.store import DEFAULT_STORE_PATH
+from shortener.store import DEFAULT_STORE_PATH, load_mappings
+from tests.test_store import SAMPLE_MAPPINGS, SAMPLE_TSV
 
 
 class ParseArgsTest(unittest.TestCase):
@@ -13,15 +16,19 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(args.host, DEFAULT_HOST)
         self.assertEqual(args.port, DEFAULT_PORT)
         self.assertEqual(args.store, DEFAULT_STORE_PATH)
+        self.assertIsNone(args.import_file)
 
     def test_default_host_is_localhost(self):
         self.assertEqual(DEFAULT_HOST, "127.0.0.1")
 
     def test_custom_host_port_and_store(self):
-        args = parse_args(["--host", "0.0.0.0", "--port", "9000", "--store", "/tmp/m.tsv"])
+        args = parse_args(["--host", "0.0.0.0", "--port", "9000", "--store", "/tmp/m.db"])
         self.assertEqual(args.host, "0.0.0.0")
         self.assertEqual(args.port, 9000)
-        self.assertEqual(args.store, "/tmp/m.tsv")
+        self.assertEqual(args.store, "/tmp/m.db")
+
+    def test_import_file(self):
+        self.assertEqual(parse_args(["--import", "old.tsv"]).import_file, "old.tsv")
 
     def test_rejects_non_integer_port(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
@@ -29,11 +36,45 @@ class ParseArgsTest(unittest.TestCase):
 
 
 class MainTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.db = str(Path(tmp.name) / "urls.db")
+
+    def run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("shortener.cli.serve") as serve, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(argv)
+        return code, out.getvalue(), err.getvalue(), serve
+
     def test_starts_server_with_parsed_options(self):
-        with mock.patch("shortener.cli.serve") as serve:
-            code = main(["--port", "9001", "--store", "m.tsv"])
+        code, _, _, serve = self.run_main(["--port", "9001", "--store", "m.db"])
         self.assertEqual(code, 0)
-        serve.assert_called_once_with(DEFAULT_HOST, 9001, "m.tsv")
+        serve.assert_called_once_with(DEFAULT_HOST, 9001, "m.db")
+
+    def test_import_loads_file_and_does_not_serve(self):
+        code, out, _, serve = self.run_main(["--import", str(SAMPLE_TSV), "--store", self.db])
+        self.assertEqual(code, 0)
+        self.assertIn("Imported 10 new mapping(s)", out)
+        self.assertEqual(load_mappings(self.db), SAMPLE_MAPPINGS)
+        serve.assert_not_called()
+
+    def test_import_twice_reports_nothing_new(self):
+        self.run_main(["--import", str(SAMPLE_TSV), "--store", self.db])
+        code, out, _, _ = self.run_main(["--import", str(SAMPLE_TSV), "--store", self.db])
+        self.assertEqual(code, 0)
+        self.assertIn("Imported 0 new mapping(s)", out)
+
+    def test_import_failure_returns_1_with_message(self):
+        bad = Path(self.db).with_name("bad.tsv")
+        bad.write_text("AAAAAAA\tjavascript:alert(1)\n", encoding="utf-8")
+        for name, path in {"bad line": bad, "missing file": bad.with_name("missing.tsv")}.items():
+            with self.subTest(name):
+                code, _, err, serve = self.run_main(["--import", str(path), "--store", self.db])
+                self.assertEqual(code, 1)
+                self.assertIn("import failed", err)
+                serve.assert_not_called()
+        self.assertFalse(Path(self.db).exists())
 
 
 if __name__ == "__main__":

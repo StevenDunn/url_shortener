@@ -1,79 +1,201 @@
-"""Flat-file storage of short code -> URL mappings.
+"""SQLite storage of short code -> URL mappings.
 
-The file holds one `code<TAB>url` line per mapping. Tabs and newlines can't
-appear in either field: codes are letters and digits only, and validate_url
-rejects whitespace and control characters.
+One table, `urls`, with a row per mapping. The database enforces that every
+code and every URL appears at most once, so callers don't have to check
+before inserting.
 
-Access is locked with flock on the file itself: readers take a shared lock,
-writers an exclusive one, so many readers or one writer at a time, across
-threads and processes. flock is Unix-only.
+Locking: the database runs in WAL (write-ahead log) mode, which allows many
+readers and one writer at a time, and readers and the writer never block
+each other. Writers queue for up to BUSY_TIMEOUT_MS; past that the store
+raises StoreBusyError.
 """
 
-import fcntl
 import os
+import sqlite3
+import time
 from collections.abc import Iterator
-from contextlib import contextmanager
-from typing import TextIO
+from contextlib import closing, contextmanager
+from pathlib import Path
 
-from shortener.codes import DEFAULT_LENGTH, generate_code
-from shortener.urls import validate_url
+from shortener.codes import DEFAULT_LENGTH, generate_code, is_valid_code
+from shortener.urls import InvalidURLError, validate_url
 
-DEFAULT_STORE_PATH = "urls.tsv"
+DEFAULT_STORE_PATH = "urls.db"
 MAX_ATTEMPTS = 10
+BUSY_TIMEOUT_MS = 5000
 
 StorePath = str | os.PathLike[str]
 
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS urls (
+    code       TEXT PRIMARY KEY,
+    url        TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+)
+"""
+
+
+class StoreBusyError(Exception):
+    """Raised when the database stays locked by another writer for longer than BUSY_TIMEOUT_MS."""
+
+
+def _is_busy(e: sqlite3.OperationalError) -> bool:
+    return e.sqlite_errorcode in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
+
 
 @contextmanager
-def _locked(path: StorePath, mode: str, lock: int) -> Iterator[TextIO]:
-    """Open `path` and hold `lock` (fcntl.LOCK_SH or LOCK_EX) until the file is closed."""
-    with open(path, mode, encoding="utf-8") as f:
-        fcntl.flock(f, lock)
-        yield f
+def _busy_as_error() -> Iterator[None]:
+    """Turn SQLite's "database is locked" errors into StoreBusyError."""
+    try:
+        yield
+    except sqlite3.OperationalError as e:
+        if _is_busy(e):
+            raise StoreBusyError(f"store is busy: {e}") from e
+        raise
 
 
-def _parse(text: str) -> dict[str, str]:
-    mappings = {}
-    for line in text.splitlines():
-        if line:
-            code, url = line.split("\t", 1)
-            mappings[code] = url
-    return mappings
+def _initialise(conn: sqlite3.Connection) -> None:
+    """Enable WAL and create the table, retrying while other connections hold locks.
+
+    Needed on a brand-new database: switching to WAL can fail with "locked"
+    straight away, without waiting for the busy timeout, when several
+    connections open the file at once. journal_mode is stored in the database
+    file, so once it's WAL this is just two cheap no-op statements.
+    """
+    deadline = time.monotonic() + BUSY_TIMEOUT_MS / 1000
+    while True:
+        try:
+            if conn.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute(_SCHEMA)
+            return
+        except sqlite3.OperationalError as e:
+            if not _is_busy(e) or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def _connect(path: StorePath) -> sqlite3.Connection:
+    """Open the database for writing, creating it and its table and enabling WAL if needed."""
+    conn = sqlite3.connect(path, autocommit=True, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        _initialise(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _query(path: StorePath, sql: str, params: tuple = ()) -> list[tuple]:
+    """Run a read-only query. A missing database or table gives no rows."""
+    path = Path(path)
+    if not path.exists():
+        return []
+    # Read-only, so reading never creates the database file.
+    uri = f"{path.absolute().as_uri()}?mode=ro"
+    with _busy_as_error(), closing(sqlite3.connect(uri, uri=True, autocommit=True, timeout=BUSY_TIMEOUT_MS / 1000)) as conn:
+        try:
+            return conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError as e:
+            if "no such table" in str(e):
+                return []
+            raise
+
+
+def lookup(path: StorePath, code: str) -> str | None:
+    """Return the URL stored under `code`, or None. Uses the primary-key index, so it doesn't scan the table."""
+    rows = _query(path, "SELECT url FROM urls WHERE code = ?", (code,))
+    return rows[0][0] if rows else None
 
 
 def load_mappings(path: StorePath) -> dict[str, str]:
-    """Return all stored mappings as {code: url}. A missing file means no mappings."""
-    try:
-        with _locked(path, "r", fcntl.LOCK_SH) as f:
-            return _parse(f.read())
-    except FileNotFoundError:
-        return {}
+    """Return all stored mappings as {code: url}. A missing database means no mappings."""
+    return dict(_query(path, "SELECT code, url FROM urls"))
 
 
 def save_mapping(path: StorePath, code: str, url: str) -> None:
-    """Append one code -> url mapping, creating the file if needed."""
-    with _locked(path, "a", fcntl.LOCK_EX) as f:
-        f.write(f"{code}\t{url}\n")
+    """Store one code -> url mapping. Raises sqlite3.IntegrityError if either is already stored."""
+    with _busy_as_error(), closing(_connect(path)) as conn:
+        conn.execute("INSERT INTO urls (code, url) VALUES (?, ?)", (code, url))
 
 
 def shorten_and_save(url: object, path: StorePath = DEFAULT_STORE_PATH, length: int = DEFAULT_LENGTH) -> str:
     """Validate `url`, store it under a new short code, and return the code.
 
-    A URL that is already stored gets its existing code back. The lookup and
-    the append happen under one exclusive lock, so concurrent calls can't
-    store the same URL twice or reuse a code.
+    A URL that is already stored gets its existing code back. Everything runs
+    in one BEGIN IMMEDIATE transaction, which takes the write lock up front
+    (waiting up to BUSY_TIMEOUT_MS for another writer), so the insert and the
+    read-back of the code see a consistent database. The UNIQUE constraints
+    do the rest: an already-stored URL makes the insert a no-op, and a code
+    that's already taken raises IntegrityError, so another code is tried.
     """
     url = validate_url(url)
-    with _locked(path, "a+", fcntl.LOCK_EX) as f:
-        f.seek(0)
-        mappings = _parse(f.read())
-        for code, stored_url in mappings.items():
-            if stored_url == url:
+    with _busy_as_error(), closing(_connect(path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for _ in range(MAX_ATTEMPTS):
+                try:
+                    conn.execute(
+                        "INSERT INTO urls (code, url) VALUES (?, ?) ON CONFLICT (url) DO NOTHING",
+                        (generate_code(length), url),
+                    )
+                except sqlite3.IntegrityError:
+                    continue
+                (code,) = conn.execute("SELECT code FROM urls WHERE url = ?", (url,)).fetchone()
+                conn.execute("COMMIT")
                 return code
-
-        for _ in range(MAX_ATTEMPTS):
-            code = generate_code(length)
-            if code not in mappings:
-                f.write(f"{code}\t{url}\n")
-                return code
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
     raise RuntimeError(f"could not find an unused code after {MAX_ATTEMPTS} attempts")
+
+
+def _read_tsv(tsv_path: StorePath) -> list[tuple[int, str, str]]:
+    """Parse a pre-SQLite `code<TAB>url` mapping file into (line number, code, url) rows."""
+    rows = []
+    for number, line in enumerate(Path(tsv_path).read_text(encoding="utf-8").splitlines(), start=1):
+        if not line:
+            continue
+        code, tab, url = line.partition("\t")
+        if not tab:
+            raise ValueError(f"line {number}: expected code<TAB>url")
+        if not is_valid_code(code):
+            raise ValueError(f"line {number}: invalid short code {code!r}")
+        try:
+            url = validate_url(url)
+        except InvalidURLError as e:
+            raise ValueError(f"line {number}: {e}") from None
+        rows.append((number, code, url))
+    return rows
+
+
+def import_tsv(tsv_path: StorePath, path: StorePath = DEFAULT_STORE_PATH) -> int:
+    """Import a flat `code<TAB>url` file from the pre-SQLite store; return how many rows were added.
+
+    Codes are kept, so short links that were already handed out keep working.
+    Mappings that are already stored exactly are skipped, so re-running an
+    import is safe. Anything else is all-or-nothing: a malformed line, an
+    invalid code or URL, or a code or URL already stored with a different
+    partner raises ValueError naming the line, and nothing is imported.
+    """
+    rows = _read_tsv(tsv_path)
+    with _busy_as_error(), closing(_connect(path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            added = 0
+            for number, code, url in rows:
+                stored_url = conn.execute("SELECT url FROM urls WHERE code = ?", (code,)).fetchone()
+                if stored_url is not None:
+                    if stored_url[0] == url:
+                        continue
+                    raise ValueError(f"line {number}: code {code!r} is already stored for {stored_url[0]!r}")
+                stored_code = conn.execute("SELECT code FROM urls WHERE url = ?", (url,)).fetchone()
+                if stored_code is not None:
+                    raise ValueError(f"line {number}: URL is already stored under code {stored_code[0]!r}")
+                conn.execute("INSERT INTO urls (code, url) VALUES (?, ?)", (code, url))
+                added += 1
+            conn.execute("COMMIT")
+            return added
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
