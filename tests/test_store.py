@@ -1,7 +1,8 @@
-import fcntl
+import sqlite3
 import tempfile
 import threading
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -15,34 +16,44 @@ class TempStoreTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.path = Path(tmp.name) / "urls.tsv"
+        self.path = Path(tmp.name) / "urls.db"
+
+    def row_count(self):
+        with closing(sqlite3.connect(self.path)) as conn:
+            return conn.execute("SELECT COUNT(*) FROM urls").fetchone()[0]
 
 
 class LoadMappingsTest(TempStoreTestCase):
-    def test_missing_file_is_empty(self):
+    def test_missing_database_is_empty_and_not_created(self):
+        self.assertEqual(load_mappings(self.path), {})
+        self.assertFalse(self.path.exists())
+
+    def test_database_without_table_is_empty(self):
+        sqlite3.connect(self.path).close()
         self.assertEqual(load_mappings(self.path), {})
 
-    def test_reads_saved_lines(self):
-        self.path.write_text("abc1234\thttps://a.com\nXYZ9876\thttps://b.com\n", encoding="utf-8")
+    def test_reads_saved_mappings(self):
+        save_mapping(self.path, "abc1234", "https://a.com")
+        save_mapping(self.path, "XYZ9876", "https://b.com")
         self.assertEqual(load_mappings(self.path), {"abc1234": "https://a.com", "XYZ9876": "https://b.com"})
-
-    def test_skips_blank_lines(self):
-        self.path.write_text("\nabc1234\thttps://a.com\n\n", encoding="utf-8")
-        self.assertEqual(load_mappings(self.path), {"abc1234": "https://a.com"})
 
 
 class SaveMappingTest(TempStoreTestCase):
-    def test_creates_file(self):
+    def test_creates_database(self):
         save_mapping(self.path, "abc1234", "https://a.com")
-        self.assertEqual(self.path.read_text(encoding="utf-8"), "abc1234\thttps://a.com\n")
+        self.assertTrue(self.path.exists())
+        self.assertEqual(load_mappings(self.path), {"abc1234": "https://a.com"})
 
-    def test_appends_in_order(self):
+    def test_round_trips_non_ascii(self):
+        save_mapping(self.path, "XYZ9876", "https://bücher.de/straße")
+        self.assertEqual(load_mappings(self.path), {"XYZ9876": "https://bücher.de/straße"})
+
+    def test_rejects_duplicate_code_or_url(self):
         save_mapping(self.path, "abc1234", "https://a.com")
-        save_mapping(self.path, "XYZ9876", "https://bücher.de")
-        self.assertEqual(
-            self.path.read_text(encoding="utf-8"),
-            "abc1234\thttps://a.com\nXYZ9876\thttps://bücher.de\n",
-        )
+        for code, url in (("abc1234", "https://b.com"), ("XYZ9876", "https://a.com")):
+            with self.subTest(code=code, url=url), self.assertRaises(sqlite3.IntegrityError):
+                save_mapping(self.path, code, url)
+        self.assertEqual(load_mappings(self.path), {"abc1234": "https://a.com"})
 
 
 class ShortenAndSaveTest(TempStoreTestCase):
@@ -62,7 +73,7 @@ class ShortenAndSaveTest(TempStoreTestCase):
         first = shorten_and_save("https://www.google.com", self.path)
         second = shorten_and_save("  https://www.google.com ", self.path)
         self.assertEqual(first, second)
-        self.assertEqual(len(self.path.read_text(encoding="utf-8").splitlines()), 1)
+        self.assertEqual(self.row_count(), 1)
 
     def test_invalid_url_writes_nothing(self):
         with self.assertRaises(InvalidURLError):
@@ -85,59 +96,7 @@ class ShortenAndSaveTest(TempStoreTestCase):
         self.assertEqual(load_mappings(self.path), {"AAAAAAA": "https://a.com"})
 
 
-class LockingTest(TempStoreTestCase):
-    """Locks are held here through a separate file handle, as another process would."""
-
-    BLOCKED_SECONDS = 0.2
-
-    def setUp(self):
-        super().setUp()
-        save_mapping(self.path, "AAAAAAA", "https://a.com")
-
-    def hold_lock(self, lock):
-        f = open(self.path, "a")
-        self.addCleanup(f.close)
-        fcntl.flock(f, lock)
-        return f
-
-    def start(self, target):
-        result = {}
-        thread = threading.Thread(target=lambda: result.update(value=target()))
-        thread.start()
-        self.addCleanup(thread.join, 5)
-        return thread, result
-
-    def assert_blocked_until_released(self, held, target):
-        thread, result = self.start(target)
-        thread.join(self.BLOCKED_SECONDS)
-        self.assertTrue(thread.is_alive(), "should wait for the lock")
-        held.close()
-        thread.join(5)
-        self.assertFalse(thread.is_alive(), "should finish once the lock is released")
-        return result.get("value")
-
-    def test_readers_share_the_lock(self):
-        self.hold_lock(fcntl.LOCK_SH)
-        thread, result = self.start(lambda: load_mappings(self.path))
-        thread.join(5)
-        self.assertFalse(thread.is_alive())
-        self.assertEqual(result["value"], {"AAAAAAA": "https://a.com"})
-
-    def test_writer_waits_for_reader(self):
-        held = self.hold_lock(fcntl.LOCK_SH)
-        self.assert_blocked_until_released(held, lambda: save_mapping(self.path, "BBBBBBB", "https://b.com"))
-        self.assertEqual(load_mappings(self.path)["BBBBBBB"], "https://b.com")
-
-    def test_shorten_waits_for_reader(self):
-        held = self.hold_lock(fcntl.LOCK_SH)
-        code = self.assert_blocked_until_released(held, lambda: shorten_and_save("https://b.com", self.path))
-        self.assertEqual(load_mappings(self.path)[code], "https://b.com")
-
-    def test_reader_waits_for_writer(self):
-        held = self.hold_lock(fcntl.LOCK_EX)
-        mappings = self.assert_blocked_until_released(held, lambda: load_mappings(self.path))
-        self.assertEqual(mappings, {"AAAAAAA": "https://a.com"})
-
+class ConcurrencyTest(TempStoreTestCase):
     def run_concurrently(self, urls):
         barrier = threading.Barrier(len(urls))
         codes = [None] * len(urls)
@@ -157,15 +116,12 @@ class LockingTest(TempStoreTestCase):
         urls = [f"https://example.com/{i}" for i in range(20)]
         codes = self.run_concurrently(urls)
         self.assertEqual(len(set(codes)), 20)
-        mappings = load_mappings(self.path)
-        self.assertEqual(len(mappings), 21)
-        for url, code in zip(urls, codes):
-            self.assertEqual(mappings[code], url)
+        self.assertEqual(load_mappings(self.path), dict(zip(codes, urls)))
 
     def test_concurrent_same_url_is_stored_once(self):
         codes = self.run_concurrently(["https://example.com/same"] * 10)
         self.assertEqual(len(set(codes)), 1)
-        self.assertEqual(len(self.path.read_text(encoding="utf-8").splitlines()), 2)
+        self.assertEqual(self.row_count(), 1)
 
 
 if __name__ == "__main__":

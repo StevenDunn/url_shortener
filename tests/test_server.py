@@ -17,7 +17,7 @@ class ServerTestCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        self.path = Path(tmp.name) / "urls.tsv"
+        self.path = Path(tmp.name) / "urls.db"
 
         self.server = make_server("127.0.0.1", 0, self.path, log=False)
         self.addCleanup(self.server.server_close)

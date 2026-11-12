@@ -4,3 +4,6 @@ __pycache__/
 
 # Runtime mapping file written by the server
 urls.tsv
+
+# Runtime database written by the server (plus SQLite journal/WAL files)
+urls.db*

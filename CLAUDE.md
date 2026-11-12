@@ -22,7 +22,7 @@ HTTP API (JSON in/out), bound to `127.0.0.1:8000` by default:
 Run from the repo root (no install step; there is no `pyproject.toml`):
 
 ```
-python -m shortener [--host 127.0.0.1] [--port 8000] [--store urls.tsv]   # run; Ctrl-C stops
+python -m shortener [--host 127.0.0.1] [--port 8000] [--store urls.db]    # run; Ctrl-C stops
 python -m unittest                                         # full suite
 python -m unittest tests.test_cli                          # one file
 python -m unittest tests.test_cli.ParseArgsTest.test_defaults   # one test
@@ -38,10 +38,11 @@ Request flow: `cli.main` → `server.serve` → `ShortenerHandler` → `store.sh
 
 - `shortener/cli.py`: `parse_args(argv)` and `main(argv) -> int`. Both take an optional `argv` list so tests can call them directly instead of patching `sys.argv`.
 - `shortener/server.py`: `ThreadingHTTPServer` (one thread per request). `make_server(host, port, store_path, log)` builds it without starting; `serve()` runs it until Ctrl-C.
-- `shortener/store.py`: the mapping file, one `code<TAB>url` line per mapping (UTF-8, append-only). No escaping is needed because codes are base62 and `validate_url` rejects whitespace/control characters — keep both of those true. The server re-reads the file on every GET, so mappings written by other processes show up immediately.
-- **Locking**: `fcntl.flock` on the mapping file itself — `LOCK_SH` for readers, `LOCK_EX` for writers (many readers or one writer, across threads and processes; Unix-only). `shorten_and_save` does its duplicate check, code choice and append under a single exclusive lock; don't split that into separate `load_mappings` + `save_mapping` calls or concurrent requests can race.
+- `shortener/store.py`: SQLite via stdlib `sqlite3` (default `urls.db`), one table `urls(code TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, created_at)`. Each call opens its own connection (autocommit), so it's safe from any thread or process. Readers open the DB read-only, so a GET never creates the file.
+- **Uniqueness is the DB's job**: `shorten_and_save` does `INSERT ... ON CONFLICT (url) DO NOTHING` then `SELECT code WHERE url = ?`. An existing URL makes the insert a no-op (same code back); a taken code raises `IntegrityError` → retry with a new code. Don't replace this with a read-then-insert check — that reintroduces a race. Concurrent writers are serialised by SQLite's own locking (default 5 s busy timeout).
+- **Migration in progress** on branch `sqlite-storage`: (1) storage — done; (2) locking — WAL mode + `BEGIN IMMEDIATE` + `StoreBusyError`→503; (3) interface — indexed `lookup(path, code)` for GET instead of `load_mappings`; (4) `import_tsv` for old flat files (`tests/fixtures/sample_urls.tsv` was written by the pre-migration flat-file store).
 - `shortener/urls.py`: `validate_url` (allowed schemes: http, https, ftp, gopher, mailto; credentials only allowed for ftp). `shorten()` is a pure validate-and-generate helper that stores nothing.
-- `tests/` mirrors the package: one `tests/test_<module>.py` per `shortener/<module>.py`. Tests capture output with `contextlib.redirect_stdout`/`redirect_stderr`. Server tests run a real server on port 0 in a thread with a temp store and use `http.client` (it doesn't follow redirects); lock tests hold `flock` on a separate file handle, as another process would.
+- `tests/` mirrors the package: one `tests/test_<module>.py` per `shortener/<module>.py`. Tests capture output with `contextlib.redirect_stdout`/`redirect_stderr`. Server tests run a real server on port 0 in a thread with a temp store and use `http.client` (it doesn't follow redirects). Store tests use a temp `urls.db` and check rows with their own `sqlite3` connection.
 
 ## Working conventions
 
