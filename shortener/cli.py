@@ -3,11 +3,18 @@
 import argparse
 import sys
 
-from shortener.server import serve
+from shortener.server import normalize_base_url, serve
 from shortener.store import DEFAULT_STORE_PATH, StoreBusyError, import_tsv
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+
+
+def _base_url_arg(value: str) -> str:
+    try:
+        return normalize_base_url(value)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(str(e)) from None
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -17,6 +24,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"port to listen on (default: {DEFAULT_PORT})")
     parser.add_argument(
         "--store", default=DEFAULT_STORE_PATH, help=f"SQLite database to read and write (default: {DEFAULT_STORE_PATH})"
+    )
+    parser.add_argument(
+        "--base-url",
+        type=_base_url_arg,
+        metavar="URL",
+        help="prefix for short links in responses, e.g. https://sho.rt (default: from the request's Host header)",
     )
     parser.add_argument(
         "--import",
@@ -38,5 +51,5 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(f"Imported {added} new mapping(s) from {args.import_file} into {args.store}")
         return 0
-    serve(args.host, args.port, args.store)
+    serve(args.host, args.port, args.store, args.base_url)
     return 0

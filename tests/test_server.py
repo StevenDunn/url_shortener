@@ -8,20 +8,23 @@ import threading
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.parse import urlsplit
 
 from shortener.codes import is_valid_code
-from shortener.server import MAX_BODY_BYTES, ShortenerServer, _location, make_server, serve
+from shortener.server import MAX_BODY_BYTES, ShortenerServer, _location, make_server, normalize_base_url, serve
 from shortener.store import StoreBusyError, import_tsv, load_mappings, save_mapping
 from tests.test_store import SAMPLE_MAPPINGS, SAMPLE_TSV
 
 
 class ServerTestCase(unittest.TestCase):
+    BASE_URL = None
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.path = Path(tmp.name) / "urls.db"
 
-        self.server = make_server("127.0.0.1", 0, self.path, log=False)
+        self.server = make_server("127.0.0.1", 0, self.path, log=False, base_url=self.BASE_URL)
         self.addCleanup(self.server.server_close)
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.01})
         thread.start()
@@ -149,6 +152,84 @@ class GetTest(ServerTestCase):
         self.assertEqual(status, 404)
 
 
+class ShortUrlFromHostTest(ServerTestCase):
+    def short_url(self, headers=None):
+        status, _, body = self.request("POST", "/", json.dumps({"url": "https://www.google.com"}), headers)
+        self.assertEqual(status, 201)
+        body = json.loads(body)
+        return body["short_url"].removesuffix(body["code"])
+
+    def test_uses_host_header(self):
+        for host in ("sho.rt", "sho.rt:8443", "localhost:8000", "192.168.1.5:8000", "[::1]:8000"):
+            with self.subTest(host=host):
+                self.assertEqual(self.short_url({"Host": host}), f"http://{host}/")
+
+    def test_falls_back_to_bound_address_for_bad_host_header(self):
+        for host in ("evil.com/path", "a b", "user@evil.com", "evil.com:99999999", ""):
+            with self.subTest(host=host):
+                self.assertEqual(self.short_url({"Host": host}), f"http://127.0.0.1:{self.port}/")
+
+    def test_falls_back_to_bound_address_without_host_header(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        self.addCleanup(conn.close)
+        body = json.dumps({"url": "https://www.google.com"}).encode()
+        conn.putrequest("POST", "/", skip_host=True)
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders(body)
+        result = json.loads(conn.getresponse().read())
+        self.assertEqual(result["short_url"], f"http://127.0.0.1:{self.port}/{result['code']}")
+
+
+class ShortUrlFromBaseUrlTest(ShortUrlFromHostTest):
+    BASE_URL = "https://sho.rt/s"
+
+    def test_uses_host_header(self):
+        self.assertEqual(self.short_url({"Host": "other.example"}), "https://sho.rt/s/")
+
+    def test_falls_back_to_bound_address_for_bad_host_header(self):
+        self.assertEqual(self.short_url({"Host": "evil.com/path"}), "https://sho.rt/s/")
+
+    def test_falls_back_to_bound_address_without_host_header(self):
+        self.assertEqual(self.short_url(), "https://sho.rt/s/")
+
+    def test_short_url_redirects(self):
+        _, body = self.post_url("https://www.google.com")
+        path = urlsplit(body["short_url"]).path.removeprefix("/s")
+        status, headers, _ = self.request("GET", path)
+        self.assertEqual(status, 302)
+        self.assertEqual(headers["Location"], "https://www.google.com")
+
+
+class NormalizeBaseUrlTest(unittest.TestCase):
+    def test_accepts_and_strips_trailing_slash(self):
+        for value, expected in {
+            "https://sho.rt": "https://sho.rt",
+            "https://sho.rt/": "https://sho.rt",
+            "http://localhost:8000": "http://localhost:8000",
+            "https://example.com/s/": "https://example.com/s",
+            "  HTTPS://sho.rt  ": "HTTPS://sho.rt",
+        }.items():
+            with self.subTest(value=value):
+                self.assertEqual(normalize_base_url(value), expected)
+
+    def test_rejects(self):
+        for value in (
+            "",
+            "sho.rt",
+            "ftp://sho.rt",
+            "mailto:a@b.com",
+            "https://",
+            "https://sho.rt?x=1",
+            "https://sho.rt/?",
+            "https://sho.rt#frag",
+            "https://user:pass@sho.rt",
+            "https://sho.rt:99999",
+            "https://sho rt",
+        ):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                normalize_base_url(value)
+
+
 class BusyStoreTest(ServerTestCase):
     def test_post_returns_503_while_another_writer_holds_the_lock(self):
         save_mapping(self.path, "AAAAAAA", "https://a.com")
@@ -180,22 +261,36 @@ class LocationTest(unittest.TestCase):
 
 class MakeServerTest(unittest.TestCase):
     def test_configures_server(self):
-        with make_server("127.0.0.1", 0, "m.tsv", log=False) as server:
+        with make_server("127.0.0.1", 0, "m.db", log=False, base_url="https://sho.rt") as server:
             self.assertIsInstance(server, ShortenerServer)
             self.assertEqual(server.server_address[0], "127.0.0.1")
-            self.assertEqual(server.store_path, "m.tsv")
+            self.assertEqual(server.store_path, "m.db")
             self.assertFalse(server.log)
+            self.assertEqual(server.base_url, "https://sho.rt")
+
+    def test_base_url_defaults_to_none(self):
+        with make_server("127.0.0.1", 0, "m.db", log=False) as server:
+            self.assertIsNone(server.base_url)
 
 
 class ServeTest(unittest.TestCase):
-    def test_prints_address_and_stops_on_ctrl_c(self):
+    def run_serve(self, *args):
         out = io.StringIO()
         with (
             mock.patch.object(ShortenerServer, "serve_forever", side_effect=KeyboardInterrupt),
             contextlib.redirect_stdout(out),
         ):
-            serve("127.0.0.1", 0, "m.tsv")
-        self.assertRegex(out.getvalue(), r"Serving on http://127\.0\.0\.1:\d+ \(store: m\.tsv\)")
+            serve("127.0.0.1", 0, "m.db", *args)
+        return out.getvalue()
+
+    def test_prints_address_and_stops_on_ctrl_c(self):
+        self.assertRegex(
+            self.run_serve(),
+            r"Serving on http://127\.0\.0\.1:\d+ \(store: m\.db; short links: from the request's Host header\)",
+        )
+
+    def test_prints_base_url(self):
+        self.assertIn("short links: https://sho.rt)", self.run_serve("https://sho.rt"))
 
 
 if __name__ == "__main__":

@@ -17,6 +17,18 @@ class ParseArgsTest(unittest.TestCase):
         self.assertEqual(args.port, DEFAULT_PORT)
         self.assertEqual(args.store, DEFAULT_STORE_PATH)
         self.assertIsNone(args.import_file)
+        self.assertIsNone(args.base_url)
+
+    def test_base_url_is_normalized(self):
+        self.assertEqual(parse_args(["--base-url", "https://sho.rt/"]).base_url, "https://sho.rt")
+
+    def test_rejects_invalid_base_url(self):
+        for value in ("sho.rt", "ftp://sho.rt", "https://sho.rt?x=1"):
+            with self.subTest(value=value):
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit):
+                    parse_args(["--base-url", value])
+                self.assertIn("--base-url", err.getvalue())
 
     def test_default_host_is_localhost(self):
         self.assertEqual(DEFAULT_HOST, "127.0.0.1")
@@ -50,7 +62,11 @@ class MainTest(unittest.TestCase):
     def test_starts_server_with_parsed_options(self):
         code, _, _, serve = self.run_main(["--port", "9001", "--store", "m.db"])
         self.assertEqual(code, 0)
-        serve.assert_called_once_with(DEFAULT_HOST, 9001, "m.db")
+        serve.assert_called_once_with(DEFAULT_HOST, 9001, "m.db", None)
+
+    def test_passes_base_url_to_server(self):
+        _, _, _, serve = self.run_main(["--base-url", "https://sho.rt/"])
+        serve.assert_called_once_with(DEFAULT_HOST, DEFAULT_PORT, DEFAULT_STORE_PATH, "https://sho.rt")
 
     def test_import_loads_file_and_does_not_serve(self):
         code, out, _, serve = self.run_main(["--import", str(SAMPLE_TSV), "--store", self.db])
