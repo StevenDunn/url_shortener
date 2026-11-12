@@ -11,6 +11,7 @@ HTTP API (JSON in/out), bound to `127.0.0.1:8000` by default:
 - `POST /` with `{"url": "..."}` → `201 {"code", "url", "short_url"}`; same URL → same code. `short_url` is `--base-url` + `/<code>` if set; otherwise `http://<Host header>/<code>` (Host must look like `host[:port]`, else the bound address is used). The server always serves codes at `/<code>`, so a `--base-url` with a path prefix (e.g. `https://sho.rt/s`) needs a proxy that strips it; behind HTTPS, set `--base-url` (the Host fallback is always `http://`). Bad input → `400 {"error"}`; no `Content-Length` → `411`; body > 8 KB → `413`.
 - `GET /<code>` → `302` with `Location: <url>` (non-ASCII percent-encoded); unknown → `404`.
 - Store locked by another writer past the busy timeout → `503` with `Retry-After: 1`.
+- Every connection has a `REQUEST_TIMEOUT_SECONDS` (10 s) socket timeout (`ShortenerHandler.timeout`): idle or stalled connections are closed; a stalled POST body gets `408`. Tests patch `ShortenerHandler.timeout` to keep this short.
 
 ## Environment
 

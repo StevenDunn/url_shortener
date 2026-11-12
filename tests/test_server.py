@@ -2,16 +2,27 @@ import contextlib
 import http.client
 import io
 import json
+import socket
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 from urllib.parse import urlsplit
 
 from shortener.codes import is_valid_code
-from shortener.server import MAX_BODY_BYTES, ShortenerServer, _location, make_server, normalize_base_url, serve
+from shortener.server import (
+    MAX_BODY_BYTES,
+    REQUEST_TIMEOUT_SECONDS,
+    ShortenerHandler,
+    ShortenerServer,
+    _location,
+    make_server,
+    normalize_base_url,
+    serve,
+)
 from shortener.store import StoreBusyError, import_tsv, load_mappings, save_mapping
 from tests.test_store import SAMPLE_MAPPINGS, SAMPLE_TSV
 
@@ -230,6 +241,54 @@ class NormalizeBaseUrlTest(unittest.TestCase):
                 normalize_base_url(value)
 
 
+class TimeoutTest(ServerTestCase):
+    TIMEOUT = 0.2
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(ShortenerHandler, "timeout", self.TIMEOUT)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def send_raw(self, data):
+        """Send `data`, then read until the server closes the connection. Returns (reply, seconds)."""
+        sock = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+        self.addCleanup(sock.close)
+        start = time.monotonic()
+        sock.sendall(data)
+        reply = b""
+        while chunk := sock.recv(4096):
+            reply += chunk
+        return reply, time.monotonic() - start
+
+    def test_stalled_body_gets_408_and_is_closed(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            reply, seconds = self.send_raw(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+        self.assertTrue(reply.startswith(b"HTTP/1.0 408"), reply[:40])
+        self.assertIn(b"timed out", reply)
+        self.assertLess(seconds, 2)
+        self.assertEqual(err.getvalue(), "", "a timeout must not print a traceback")
+        self.assertFalse(self.path.exists())
+
+    def test_idle_connection_is_closed(self):
+        reply, seconds = self.send_raw(b"")
+        self.assertEqual(reply, b"")
+        self.assertLess(seconds, 2)
+
+    def test_stalled_headers_are_closed(self):
+        reply, seconds = self.send_raw(b"GET /AAAAAAA HTTP/1.1\r\nHost: x\r\n")
+        self.assertEqual(reply, b"")
+        self.assertLess(seconds, 2)
+
+    def test_keeps_serving_after_timeouts(self):
+        self.send_raw(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n")
+        self.send_raw(b"")
+        status, body = self.post_url("https://www.google.com")
+        self.assertEqual(status, 201)
+        self.assertTrue(is_valid_code(body["code"]))
+
+
 class BusyStoreTest(ServerTestCase):
     def test_post_returns_503_while_another_writer_holds_the_lock(self):
         save_mapping(self.path, "AAAAAAA", "https://a.com")
@@ -267,6 +326,10 @@ class MakeServerTest(unittest.TestCase):
             self.assertEqual(server.store_path, "m.db")
             self.assertFalse(server.log)
             self.assertEqual(server.base_url, "https://sho.rt")
+
+    def test_handler_uses_request_timeout(self):
+        self.assertEqual(REQUEST_TIMEOUT_SECONDS, 10)
+        self.assertEqual(ShortenerHandler.timeout, REQUEST_TIMEOUT_SECONDS)
 
     def test_base_url_defaults_to_none(self):
         with make_server("127.0.0.1", 0, "m.db", log=False) as server:

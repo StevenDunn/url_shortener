@@ -11,6 +11,10 @@ from shortener.store import StoreBusyError, StorePath, lookup, shorten_and_save
 from shortener.urls import InvalidURLError, validate_url
 
 MAX_BODY_BYTES = 8192
+# How long a client may go without sending anything before its connection is
+# closed. Without it, a client that never finishes its request holds a
+# server thread forever.
+REQUEST_TIMEOUT_SECONDS = 10
 
 # Every printable ASCII character except space: quote() then only escapes
 # non-ASCII characters, leaving the URL's existing structure and escapes alone.
@@ -45,6 +49,11 @@ def normalize_base_url(value: str) -> str:
 class ShortenerHandler(BaseHTTPRequestHandler):
     server: "ShortenerServer"
 
+    # Socket timeout for every read and write on the connection (set by StreamRequestHandler).
+    # An idle connection, or one stuck sending its request line or headers, is closed by
+    # http.server; a stalled body read is answered with 408 in do_POST.
+    timeout = REQUEST_TIMEOUT_SECONDS
+
     def do_POST(self) -> None:
         if urlsplit(self.path).path != "/":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
@@ -64,7 +73,13 @@ class ShortenerHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            payload = json.loads(self.rfile.read(length))
+            body = self.rfile.read(length)
+        except TimeoutError:
+            self.close_connection = True
+            self._send_json(HTTPStatus.REQUEST_TIMEOUT, {"error": "timed out waiting for the request body"})
+            return
+        try:
+            payload = json.loads(body)
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "body must be JSON"})
             return
