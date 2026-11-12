@@ -35,7 +35,7 @@ curl -X POST localhost:8000/ -d '{"url": "https://www.google.com"}'
 curl -i localhost:8000/<code>
 ```
 
-CI: `.github/workflows/tests.yml` runs `python -m unittest -v` on Python 3.14 (Ubuntu and macOS) for every pull request and every push to `main`. Nothing is installed first, so a new dependency would also need adding there.
+CI: `.github/workflows/tests.yml` runs `python -m unittest -v --durations 10` on Python 3.14 (Ubuntu and macOS) for every pull request and every push to `main`. Nothing is installed first, so a new dependency would also need adding there.
 
 ## Structure
 

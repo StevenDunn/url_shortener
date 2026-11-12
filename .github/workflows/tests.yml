@@ -30,6 +30,6 @@ jobs:
         with:
           python-version: "3.14"
 
-      # Standard library only: nothing to install.
+      # Standard library only: nothing to install. --durations lists the slowest tests.
       - name: Run tests
-        run: python -m unittest -v
+        run: python -m unittest -v --durations 10
