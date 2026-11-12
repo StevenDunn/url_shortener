@@ -8,9 +8,11 @@ A URL shortener in Python: POST a URL, get back a short code; requesting the sho
 
 HTTP API (JSON in/out), bound to `127.0.0.1:8000` by default:
 
-- `POST /` with `{"url": "..."}` → `201 {"code", "url", "short_url"}`; same URL → same code. Bad input → `400 {"error"}`; no `Content-Length` → `411`; body > 8 KB → `413`.
+- `POST /` with `{"url": "..."}` → `201 {"code", "url", "short_url"}`; same URL → same code. `short_url` is `--base-url` + `/<code>` if set; otherwise `http://<Host header>/<code>` (Host must look like `host[:port]`, else the bound address is used). The server always serves codes at `/<code>`, so a `--base-url` with a path prefix (e.g. `https://sho.rt/s`) needs a proxy that strips it; behind HTTPS, set `--base-url` (the Host fallback is always `http://`). Bad input → `400 {"error"}`; no `Content-Length` → `411`; body > 8 KB → `413`.
 - `GET /<code>` → `302` with `Location: <url>` (non-ASCII percent-encoded); unknown → `404`.
 - Store locked by another writer past the busy timeout → `503` with `Retry-After: 1`.
+- Every connection has a `REQUEST_TIMEOUT_SECONDS` (10 s) socket timeout (`ShortenerHandler.timeout`): idle or stalled connections are closed; a stalled POST body gets `408`. Tests patch `ShortenerHandler.timeout` to keep this short.
+- Any other unexpected exception → `500 {"error": "internal server error"}` (no internal details in the body); the traceback goes to the server log (`log_error`, so `log=False` silences it). `do_GET`/`do_POST` only call `_run(self._get / self._post)`; put request logic in `_get`/`_post` so it stays covered. If the response had already started, the connection is just closed.
 
 ## Environment
 
@@ -23,7 +25,7 @@ HTTP API (JSON in/out), bound to `127.0.0.1:8000` by default:
 Run from the repo root (no install step; there is no `pyproject.toml`):
 
 ```
-python -m shortener [--host 127.0.0.1] [--port 8000] [--store urls.db]    # run; Ctrl-C stops
+python -m shortener [--host 127.0.0.1] [--port 8000] [--store urls.db] [--base-url https://sho.rt]   # run; Ctrl-C stops
 python -m shortener --import old.tsv [--store urls.db]    # import an old flat file, then exit
 python -m unittest                                         # full suite
 python -m unittest tests.test_cli                          # one file

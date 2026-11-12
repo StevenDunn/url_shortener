@@ -1,19 +1,30 @@
 """HTTP server: POST a URL to get a short code, GET /<code> to be redirected."""
 
 import json
+import re
+import traceback
+from collections.abc import Callable
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
 
 from shortener.codes import is_valid_code
 from shortener.store import StoreBusyError, StorePath, lookup, shorten_and_save
-from shortener.urls import InvalidURLError
+from shortener.urls import InvalidURLError, validate_url
 
 MAX_BODY_BYTES = 8192
+# How long a client may go without sending anything before its connection is
+# closed. Without it, a client that never finishes its request holds a
+# server thread forever.
+REQUEST_TIMEOUT_SECONDS = 10
 
 # Every printable ASCII character except space: quote() then only escapes
 # non-ASCII characters, leaving the URL's existing structure and escapes alone.
 _LOCATION_SAFE = "".join(chr(i) for i in range(33, 127))
+
+# A Host header we're willing to echo back in short_url: a hostname or
+# bracketed IPv6 address, optionally with a port.
+_HOST_HEADER = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?")
 
 
 def _location(url: str) -> str:
@@ -21,10 +32,58 @@ def _location(url: str) -> str:
     return quote(url, safe=_LOCATION_SAFE)
 
 
+def normalize_base_url(value: str) -> str:
+    """Check a --base-url value and return it without a trailing slash.
+
+    It must be an http(s) URL with a host and may include a path prefix
+    (e.g. https://sho.rt/s), but no credentials, query or fragment.
+    Raises ValueError otherwise.
+    """
+    url = validate_url(value)
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https"):
+        raise ValueError("base URL must start with http:// or https://")
+    if parts.query or parts.fragment or url.endswith(("?", "#")):
+        raise ValueError("base URL must not have a query or fragment")
+    return url.rstrip("/")
+
+
 class ShortenerHandler(BaseHTTPRequestHandler):
     server: "ShortenerServer"
 
+    # Socket timeout for every read and write on the connection (set by StreamRequestHandler).
+    # An idle connection, or one stuck sending its request line or headers, is closed by
+    # http.server; a stalled body read is answered with 408 in do_POST.
+    timeout = REQUEST_TIMEOUT_SECONDS
+
+    _response_started = False
+
     def do_POST(self) -> None:
+        self._run(self._post)
+
+    def do_GET(self) -> None:
+        self._run(self._get)
+
+    def _run(self, handle: Callable[[], None]) -> None:
+        """Call `handle`; on an unexpected error, log it and answer 500 instead of dropping the connection."""
+        self._response_started = False
+        try:
+            handle()
+        except Exception:
+            self.log_error("unexpected error handling %s %s:\n%s", self.command, self.path, traceback.format_exc())
+            self.close_connection = True
+            # Once a response has begun we can't start another; closing the connection is all that's left.
+            if not self._response_started:
+                try:
+                    self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal server error"})
+                except OSError:
+                    pass
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        self._response_started = True
+        super().send_response(code, message)
+
+    def _post(self) -> None:
         if urlsplit(self.path).path != "/":
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
             return
@@ -43,7 +102,13 @@ class ShortenerHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            payload = json.loads(self.rfile.read(length))
+            body = self.rfile.read(length)
+        except TimeoutError:
+            self.close_connection = True
+            self._send_json(HTTPStatus.REQUEST_TIMEOUT, {"error": "timed out waiting for the request body"})
+            return
+        try:
+            payload = json.loads(body)
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "body must be JSON"})
             return
@@ -63,13 +128,22 @@ class ShortenerHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(e)})
             return
 
-        host, port = self.server.server_address[:2]
         self._send_json(
             HTTPStatus.CREATED,
-            {"code": code, "url": payload["url"].strip(), "short_url": f"http://{host}:{port}/{code}"},
+            {"code": code, "url": payload["url"].strip(), "short_url": f"{self._base_url()}/{code}"},
         )
 
-    def do_GET(self) -> None:
+    def _base_url(self) -> str:
+        """Where short links point: --base-url if set, else the Host the client used, else the bound address."""
+        if self.server.base_url:
+            return self.server.base_url
+        host = self.headers.get("Host", "")
+        if _HOST_HEADER.fullmatch(host):
+            return f"http://{host}"
+        bound_host, bound_port = self.server.server_address[:2]
+        return f"http://{bound_host}:{bound_port}"
+
+    def _get(self) -> None:
         code = urlsplit(self.path).path.removeprefix("/")
         try:
             url = lookup(self.server.store_path, code) if is_valid_code(code) else None
@@ -79,8 +153,9 @@ class ShortenerHandler(BaseHTTPRequestHandler):
         if url is None:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown short code"})
             return
+        location = _location(url)
         self.send_response(HTTPStatus.FOUND)
-        self.send_header("Location", _location(url))
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -108,21 +183,30 @@ class ShortenerServer(ThreadingHTTPServer):
 
     store_path: StorePath
     log: bool
+    base_url: str | None
 
 
-def make_server(host: str, port: int, store_path: StorePath, log: bool = True) -> ShortenerServer:
-    """Create (but don't start) a server bound to host:port that uses `store_path`."""
+def make_server(
+    host: str, port: int, store_path: StorePath, log: bool = True, base_url: str | None = None
+) -> ShortenerServer:
+    """Create (but don't start) a server bound to host:port that uses `store_path`.
+
+    `base_url` (already checked by normalize_base_url) is the prefix for short
+    links in POST responses; without it, the request's Host header is used.
+    """
     server = ShortenerServer((host, port), ShortenerHandler)
     server.store_path = store_path
     server.log = log
+    server.base_url = base_url
     return server
 
 
-def serve(host: str, port: int, store_path: StorePath) -> None:
+def serve(host: str, port: int, store_path: StorePath, base_url: str | None = None) -> None:
     """Run the server until interrupted with Ctrl-C."""
-    with make_server(host, port, store_path) as server:
+    with make_server(host, port, store_path, base_url=base_url) as server:
         bound_host, bound_port = server.server_address[:2]
-        print(f"Serving on http://{bound_host}:{bound_port} (store: {store_path})", flush=True)
+        links = base_url or "from the request's Host header"
+        print(f"Serving on http://{bound_host}:{bound_port} (store: {store_path}; short links: {links})", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
