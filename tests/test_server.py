@@ -11,7 +11,8 @@ from unittest import mock
 
 from shortener.codes import is_valid_code
 from shortener.server import MAX_BODY_BYTES, ShortenerServer, _location, make_server, serve
-from shortener.store import StoreBusyError, load_mappings, save_mapping
+from shortener.store import StoreBusyError, import_tsv, load_mappings, save_mapping
+from tests.test_store import SAMPLE_MAPPINGS, SAMPLE_TSV
 
 
 class ServerTestCase(unittest.TestCase):
@@ -120,6 +121,14 @@ class GetTest(ServerTestCase):
         status, headers, _ = self.request("GET", "/AAAAAAA")
         self.assertEqual(status, 302)
         self.assertEqual(headers["Location"], "https://example.com/from-file")
+
+    def test_redirects_imported_codes(self):
+        import_tsv(SAMPLE_TSV, self.path)
+        for code, url in SAMPLE_MAPPINGS.items():
+            with self.subTest(code=code):
+                status, headers, _ = self.request("GET", f"/{code}")
+                self.assertEqual(status, 302)
+                self.assertEqual(headers["Location"], _location(url))
 
     def test_non_ascii_location_is_percent_encoded(self):
         save_mapping(self.path, "AAAAAAA", "https://bücher.de/straße")

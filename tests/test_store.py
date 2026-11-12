@@ -8,9 +8,21 @@ from pathlib import Path
 from unittest import mock
 
 from shortener.codes import is_valid_code
-from shortener.store import MAX_ATTEMPTS, StoreBusyError, load_mappings, lookup, save_mapping, shorten_and_save
+from shortener.store import (
+    MAX_ATTEMPTS,
+    StoreBusyError,
+    import_tsv,
+    load_mappings,
+    lookup,
+    save_mapping,
+    shorten_and_save,
+)
 from shortener.urls import InvalidURLError
 from tests.test_urls import VALID_URLS
+
+# Written by the flat-file store on main, before the SQLite migration.
+SAMPLE_TSV = Path(__file__).parent / "fixtures" / "sample_urls.tsv"
+SAMPLE_MAPPINGS = dict(line.split("\t", 1) for line in SAMPLE_TSV.read_text(encoding="utf-8").splitlines())
 
 
 class TempStoreTestCase(unittest.TestCase):
@@ -127,6 +139,105 @@ class ShortenAndSaveTest(TempStoreTestCase):
                 shorten_and_save("https://b.com", self.path)
         self.assertEqual(gen.call_count, MAX_ATTEMPTS)
         self.assertEqual(load_mappings(self.path), {"AAAAAAA": "https://a.com"})
+
+
+class ImportTsvTest(TempStoreTestCase):
+    def setUp(self):
+        super().setUp()
+        self.tsv = self.path.with_name("old.tsv")
+
+    def write_tsv(self, text):
+        self.tsv.write_text(text, encoding="utf-8")
+
+    def assert_import_fails(self, line_number):
+        before = load_mappings(self.path)
+        with self.assertRaisesRegex(ValueError, rf"^line {line_number}: "):
+            import_tsv(self.tsv, self.path)
+        self.assertEqual(load_mappings(self.path), before, "a failed import must change nothing")
+
+    def test_imports_sample_file_keeping_codes(self):
+        self.assertEqual(len(SAMPLE_MAPPINGS), 10)
+        self.assertEqual(import_tsv(SAMPLE_TSV, self.path), 10)
+        for code, url in SAMPLE_MAPPINGS.items():
+            with self.subTest(code=code):
+                self.assertEqual(lookup(self.path, code), url)
+        self.assertEqual(load_mappings(self.path), SAMPLE_MAPPINGS)
+
+    def test_reimport_adds_nothing(self):
+        import_tsv(SAMPLE_TSV, self.path)
+        self.assertEqual(import_tsv(SAMPLE_TSV, self.path), 0)
+        self.assertEqual(self.row_count(), 10)
+
+    def test_keeps_existing_mappings(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        self.assertEqual(import_tsv(SAMPLE_TSV, self.path), 10)
+        self.assertEqual(lookup(self.path, "AAAAAAA"), "https://a.com")
+        self.assertEqual(self.row_count(), 11)
+
+    def test_new_codes_avoid_imported_ones(self):
+        import_tsv(SAMPLE_TSV, self.path)
+        taken = next(iter(SAMPLE_MAPPINGS))
+        with mock.patch("shortener.store.generate_code", side_effect=[taken, "BBBBBBB"]):
+            self.assertEqual(shorten_and_save("https://b.com", self.path), "BBBBBBB")
+        self.assertEqual(lookup(self.path, taken), SAMPLE_MAPPINGS[taken])
+
+    def test_shortening_an_imported_url_returns_its_imported_code(self):
+        import_tsv(SAMPLE_TSV, self.path)
+        code, url = next(iter(SAMPLE_MAPPINGS.items()))
+        self.assertEqual(shorten_and_save(url, self.path), code)
+
+    def test_skips_blank_lines_and_exact_duplicates(self):
+        self.write_tsv("\nAAAAAAA\thttps://a.com\n\nAAAAAAA\thttps://a.com\n")
+        self.assertEqual(import_tsv(self.tsv, self.path), 1)
+        self.assertEqual(load_mappings(self.path), {"AAAAAAA": "https://a.com"})
+
+    def test_rejects_bad_lines(self):
+        bad_lines = {
+            "no tab": "AAAAAAA https://a.com",
+            "invalid code": "bad-code\thttps://a.com",
+            "empty code": "\thttps://a.com",
+            "invalid URL": "AAAAAAA\tjavascript:alert(1)",
+            "URL with a tab": "AAAAAAA\thttps://a.com\tx",
+        }
+        for name, line in bad_lines.items():
+            with self.subTest(name):
+                self.write_tsv(f"BBBBBBB\thttps://b.com\n{line}\n")
+                self.assert_import_fails(2)
+        self.assertFalse(self.path.exists(), "a bad file must not create the database")
+
+    def test_rejects_code_stored_for_a_different_url(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        self.write_tsv("BBBBBBB\thttps://b.com\nAAAAAAA\thttps://other.com\n")
+        self.assert_import_fails(2)
+
+    def test_rejects_url_stored_under_a_different_code(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        self.write_tsv("BBBBBBB\thttps://b.com\nCCCCCCC\thttps://a.com\n")
+        self.assert_import_fails(2)
+
+    def test_rejects_conflicts_within_the_file(self):
+        for name, text in {
+            "same code, different URL": "AAAAAAA\thttps://a.com\nAAAAAAA\thttps://b.com\n",
+            "same URL, different code": "AAAAAAA\thttps://a.com\nBBBBBBB\thttps://a.com\n",
+        }.items():
+            with self.subTest(name):
+                self.write_tsv(text)
+                self.assert_import_fails(2)
+
+    def test_missing_file_raises_and_creates_nothing(self):
+        with self.assertRaises(FileNotFoundError):
+            import_tsv(self.tsv, self.path)
+        self.assertFalse(self.path.exists())
+
+    def test_waits_for_other_writer_then_gives_up(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        other = sqlite3.connect(self.path, autocommit=True, timeout=0)
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        with mock.patch("shortener.store.BUSY_TIMEOUT_MS", 100), self.assertRaises(StoreBusyError):
+            import_tsv(SAMPLE_TSV, self.path)
+        other.execute("ROLLBACK")
+        self.assertEqual(self.row_count(), 1)
 
 
 class LockingTest(TempStoreTestCase):

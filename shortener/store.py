@@ -17,8 +17,8 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-from shortener.codes import DEFAULT_LENGTH, generate_code
-from shortener.urls import validate_url
+from shortener.codes import DEFAULT_LENGTH, generate_code, is_valid_code
+from shortener.urls import InvalidURLError, validate_url
 
 DEFAULT_STORE_PATH = "urls.db"
 MAX_ATTEMPTS = 10
@@ -148,3 +148,54 @@ def shorten_and_save(url: object, path: StorePath = DEFAULT_STORE_PATH, length: 
             if conn.in_transaction:
                 conn.execute("ROLLBACK")
     raise RuntimeError(f"could not find an unused code after {MAX_ATTEMPTS} attempts")
+
+
+def _read_tsv(tsv_path: StorePath) -> list[tuple[int, str, str]]:
+    """Parse a pre-SQLite `code<TAB>url` mapping file into (line number, code, url) rows."""
+    rows = []
+    for number, line in enumerate(Path(tsv_path).read_text(encoding="utf-8").splitlines(), start=1):
+        if not line:
+            continue
+        code, tab, url = line.partition("\t")
+        if not tab:
+            raise ValueError(f"line {number}: expected code<TAB>url")
+        if not is_valid_code(code):
+            raise ValueError(f"line {number}: invalid short code {code!r}")
+        try:
+            url = validate_url(url)
+        except InvalidURLError as e:
+            raise ValueError(f"line {number}: {e}") from None
+        rows.append((number, code, url))
+    return rows
+
+
+def import_tsv(tsv_path: StorePath, path: StorePath = DEFAULT_STORE_PATH) -> int:
+    """Import a flat `code<TAB>url` file from the pre-SQLite store; return how many rows were added.
+
+    Codes are kept, so short links that were already handed out keep working.
+    Mappings that are already stored exactly are skipped, so re-running an
+    import is safe. Anything else is all-or-nothing: a malformed line, an
+    invalid code or URL, or a code or URL already stored with a different
+    partner raises ValueError naming the line, and nothing is imported.
+    """
+    rows = _read_tsv(tsv_path)
+    with _busy_as_error(), closing(_connect(path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            added = 0
+            for number, code, url in rows:
+                stored_url = conn.execute("SELECT url FROM urls WHERE code = ?", (code,)).fetchone()
+                if stored_url is not None:
+                    if stored_url[0] == url:
+                        continue
+                    raise ValueError(f"line {number}: code {code!r} is already stored for {stored_url[0]!r}")
+                stored_code = conn.execute("SELECT code FROM urls WHERE url = ?", (url,)).fetchone()
+                if stored_code is not None:
+                    raise ValueError(f"line {number}: URL is already stored under code {stored_code[0]!r}")
+                conn.execute("INSERT INTO urls (code, url) VALUES (?, ?)", (code, url))
+                added += 1
+            conn.execute("COMMIT")
+            return added
+        finally:
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
