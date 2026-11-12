@@ -1,13 +1,14 @@
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
 from shortener.codes import is_valid_code
-from shortener.store import MAX_ATTEMPTS, load_mappings, save_mapping, shorten_and_save
+from shortener.store import MAX_ATTEMPTS, StoreBusyError, load_mappings, save_mapping, shorten_and_save
 from shortener.urls import InvalidURLError
 from tests.test_urls import VALID_URLS
 
@@ -96,6 +97,66 @@ class ShortenAndSaveTest(TempStoreTestCase):
         self.assertEqual(load_mappings(self.path), {"AAAAAAA": "https://a.com"})
 
 
+class LockingTest(TempStoreTestCase):
+    """Locks are held through a second sqlite3 connection, as another process would."""
+
+    BLOCKED_SECONDS = 0.2
+
+    def setUp(self):
+        super().setUp()
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        self.other = sqlite3.connect(self.path, autocommit=True, timeout=0)
+        self.addCleanup(self.other.close)
+
+    def test_database_uses_wal(self):
+        self.assertEqual(self.other.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_reader_not_blocked_by_writer(self):
+        # EXCLUSIVE would block readers in SQLite's default journal mode; in WAL it doesn't.
+        self.other.execute("BEGIN EXCLUSIVE")
+        self.other.execute("INSERT INTO urls (code, url) VALUES ('BBBBBBB', 'https://b.com')")
+        with mock.patch("shortener.store.BUSY_TIMEOUT_MS", 2000):
+            start = time.monotonic()
+            mappings = load_mappings(self.path)
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertEqual(mappings, {"AAAAAAA": "https://a.com"}, "uncommitted rows must not be visible")
+
+    def test_writer_not_blocked_by_reader(self):
+        self.other.execute("BEGIN")
+        self.other.execute("SELECT COUNT(*) FROM urls").fetchone()
+        with mock.patch("shortener.store.BUSY_TIMEOUT_MS", 2000):
+            start = time.monotonic()
+            code = shorten_and_save("https://b.com", self.path)
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertEqual(load_mappings(self.path)[code], "https://b.com")
+        # The open read transaction keeps seeing its original snapshot.
+        self.assertEqual(self.other.execute("SELECT COUNT(*) FROM urls").fetchone()[0], 1)
+
+    def test_writer_waits_for_writer(self):
+        self.other.execute("BEGIN IMMEDIATE")
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(code=shorten_and_save("https://b.com", self.path)))
+        thread.start()
+        self.addCleanup(thread.join, 5)
+
+        thread.join(self.BLOCKED_SECONDS)
+        self.assertTrue(thread.is_alive(), "should wait for the other writer")
+        self.other.execute("COMMIT")
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "should finish once the other writer commits")
+        self.assertEqual(load_mappings(self.path)[result["code"]], "https://b.com")
+
+    def test_writer_gives_up_after_busy_timeout(self):
+        self.other.execute("BEGIN IMMEDIATE")
+        with mock.patch("shortener.store.BUSY_TIMEOUT_MS", 100):
+            with self.assertRaises(StoreBusyError):
+                shorten_and_save("https://b.com", self.path)
+            with self.assertRaises(StoreBusyError):
+                save_mapping(self.path, "BBBBBBB", "https://b.com")
+        self.other.execute("ROLLBACK")
+        self.assertEqual(load_mappings(self.path), {"AAAAAAA": "https://a.com"})
+
+
 class ConcurrencyTest(TempStoreTestCase):
     def run_concurrently(self, urls):
         barrier = threading.Barrier(len(urls))
@@ -117,6 +178,16 @@ class ConcurrencyTest(TempStoreTestCase):
         codes = self.run_concurrently(urls)
         self.assertEqual(len(set(codes)), 20)
         self.assertEqual(load_mappings(self.path), dict(zip(codes, urls)))
+
+    def test_concurrent_first_use_of_new_database(self):
+        # Switching a new database to WAL can fail with "locked" without waiting
+        # for the busy timeout, so many threads opening it at once must still work.
+        for round_ in range(20):
+            with self.subTest(round=round_):
+                self.path = self.path.with_name(f"fresh{round_}.db")
+                codes = self.run_concurrently([f"https://example.com/{i}" for i in range(10)])
+                self.assertNotIn(None, codes)
+                self.assertEqual(self.row_count(), 10)
 
     def test_concurrent_same_url_is_stored_once(self):
         codes = self.run_concurrently(["https://example.com/same"] * 10)

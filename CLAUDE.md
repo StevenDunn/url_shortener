@@ -10,6 +10,7 @@ HTTP API (JSON in/out), bound to `127.0.0.1:8000` by default:
 
 - `POST /` with `{"url": "..."}` → `201 {"code", "url", "short_url"}`; same URL → same code. Bad input → `400 {"error"}`; no `Content-Length` → `411`; body > 8 KB → `413`.
 - `GET /<code>` → `302` with `Location: <url>` (non-ASCII percent-encoded); unknown → `404`.
+- Store locked by another writer past the busy timeout → `503` with `Retry-After: 1`.
 
 ## Environment
 
@@ -39,10 +40,11 @@ Request flow: `cli.main` → `server.serve` → `ShortenerHandler` → `store.sh
 - `shortener/cli.py`: `parse_args(argv)` and `main(argv) -> int`. Both take an optional `argv` list so tests can call them directly instead of patching `sys.argv`.
 - `shortener/server.py`: `ThreadingHTTPServer` (one thread per request). `make_server(host, port, store_path, log)` builds it without starting; `serve()` runs it until Ctrl-C.
 - `shortener/store.py`: SQLite via stdlib `sqlite3` (default `urls.db`), one table `urls(code TEXT PRIMARY KEY, url TEXT NOT NULL UNIQUE, created_at)`. Each call opens its own connection (autocommit), so it's safe from any thread or process. Readers open the DB read-only, so a GET never creates the file.
-- **Uniqueness is the DB's job**: `shorten_and_save` does `INSERT ... ON CONFLICT (url) DO NOTHING` then `SELECT code WHERE url = ?`. An existing URL makes the insert a no-op (same code back); a taken code raises `IntegrityError` → retry with a new code. Don't replace this with a read-then-insert check — that reintroduces a race. Concurrent writers are serialised by SQLite's own locking (default 5 s busy timeout).
-- **Migration in progress** on branch `sqlite-storage`: (1) storage — done; (2) locking — WAL mode + `BEGIN IMMEDIATE` + `StoreBusyError`→503; (3) interface — indexed `lookup(path, code)` for GET instead of `load_mappings`; (4) `import_tsv` for old flat files (`tests/fixtures/sample_urls.tsv` was written by the pre-migration flat-file store).
+- **Uniqueness is the DB's job**: `shorten_and_save` does `INSERT ... ON CONFLICT (url) DO NOTHING` then `SELECT code WHERE url = ?`. An existing URL makes the insert a no-op (same code back); a taken code raises `IntegrityError` → retry with a new code. Don't replace this with a read-then-insert check — that reintroduces a race.
+- **Locking**: WAL mode (many readers + one writer; readers and the writer never block each other, readers see only committed data). `shorten_and_save` runs in one `BEGIN IMMEDIATE` transaction, taking the write lock up front. Writers wait up to `BUSY_TIMEOUT_MS` (5 s), then `StoreBusyError` (server → 503). `_initialise` retries the WAL switch + `CREATE TABLE` while locked, because on a brand-new DB the WAL switch can fail instantly without honouring the busy timeout when several connections open it at once.
+- **Migration in progress** on branch `sqlite-storage`: (1) storage — done; (2) locking — done; (3) interface — indexed `lookup(path, code)` for GET instead of `load_mappings`; (4) `import_tsv` for old flat files (`tests/fixtures/sample_urls.tsv` was written by the pre-migration flat-file store).
 - `shortener/urls.py`: `validate_url` (allowed schemes: http, https, ftp, gopher, mailto; credentials only allowed for ftp). `shorten()` is a pure validate-and-generate helper that stores nothing.
-- `tests/` mirrors the package: one `tests/test_<module>.py` per `shortener/<module>.py`. Tests capture output with `contextlib.redirect_stdout`/`redirect_stderr`. Server tests run a real server on port 0 in a thread with a temp store and use `http.client` (it doesn't follow redirects). Store tests use a temp `urls.db` and check rows with their own `sqlite3` connection.
+- `tests/` mirrors the package: one `tests/test_<module>.py` per `shortener/<module>.py`. Tests capture output with `contextlib.redirect_stdout`/`redirect_stderr`. Server tests run a real server on port 0 in a thread with a temp store and use `http.client` (it doesn't follow redirects). Store tests use a temp `urls.db` and check rows with their own `sqlite3` connection; lock tests hold locks through a second connection (as another process would) and patch `shortener.store.BUSY_TIMEOUT_MS` to keep timeouts short.
 
 ## Working conventions
 

@@ -2,6 +2,7 @@ import contextlib
 import http.client
 import io
 import json
+import sqlite3
 import tempfile
 import threading
 import unittest
@@ -10,7 +11,7 @@ from unittest import mock
 
 from shortener.codes import is_valid_code
 from shortener.server import MAX_BODY_BYTES, ShortenerServer, _location, make_server, serve
-from shortener.store import load_mappings, save_mapping
+from shortener.store import StoreBusyError, load_mappings, save_mapping
 
 
 class ServerTestCase(unittest.TestCase):
@@ -137,6 +138,26 @@ class GetTest(ServerTestCase):
     def test_unknown_code_with_no_file_returns_404(self):
         status, _, _ = self.request("GET", "/AAAAAAA")
         self.assertEqual(status, 404)
+
+
+class BusyStoreTest(ServerTestCase):
+    def test_post_returns_503_while_another_writer_holds_the_lock(self):
+        save_mapping(self.path, "AAAAAAA", "https://a.com")
+        other = sqlite3.connect(self.path, autocommit=True, timeout=0)
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        with mock.patch("shortener.store.BUSY_TIMEOUT_MS", 100):
+            status, headers, body = self.request("POST", "/", json.dumps({"url": "https://b.com"}))
+        other.execute("ROLLBACK")
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["Retry-After"], "1")
+        self.assertIn("busy", json.loads(body)["error"])
+
+    def test_get_returns_503_when_store_is_busy(self):
+        with mock.patch("shortener.server.load_mappings", side_effect=StoreBusyError("store is busy")):
+            status, headers, _ = self.request("GET", "/AAAAAAA")
+        self.assertEqual(status, 503)
+        self.assertEqual(headers["Retry-After"], "1")
 
 
 class LocationTest(unittest.TestCase):
